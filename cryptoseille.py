@@ -1,77 +1,96 @@
-from binance.client import Client
-from datetime import datetime
-import json, sys
+import json, sys, math
+from hmmlearn import hmm
 
 with open(sys.argv[1]) as infile:
     candles = json.load(infile)
 
-class Diff:
-    # a diff between two bars of the curve
-    # open: diff between the start values of the bars
-    # close: diff between the final values of the bars
-    # high: diff between the max value of the bars' amplitude
-    # low: diff between the min value of the bars' amplitude
-    # vol: the volume (in currency) of transaction of the bar's timespan
-    # trades: number of trades during the bar's timespan
-    def __init__(self, present, past):
-        self.time   = datetime.fromtimestamp(present[0] // 1000)
-        self.open   = (float(present[1]) - float(past[1])) * 100 / float(past[1])
-        self.high   = (float(present[2]) - float(past[2])) * 100 / float(past[2])
-        self.low    = (float(present[3]) - float(past[3])) * 100 / float(past[3])
-        self.close  = (float(present[4]) - float(past[4])) * 100 / float(past[4])
-        self.vol    = float(present[7])
-        self.trades = present[8]
-
+# parse and convert data to 3D vectors and find min and max
+# of the value range
+# component 0: % change of the price (close - open) / open
+# component 1: % amplitude high (high - open) / open (>= 0)
+# component 2: % amplitude low (open - low) / open (>= 0)
 data = []
-diff_min = Diff(candles[1], candles[0])
-diff_max = Diff(candles[1], candles[0])
+min_ = [0, 0, 0]
+max_ = [0, 0, 0]
+for bar in candles:
+    open = float(bar[1])
+    high = float(bar[2])
+    low = float(bar[3])
+    close = float(bar[4])
 
-for i in range(1, len(candles)):
-    d = Diff(candles[i], candles[i-1])
-    data.append(d)
+    frac_change = (close - open) / open * 100
+    frac_high = (high - open) / open * 100
+    frac_low = (open - low) / open * 100
 
-    print('{}: OPEN: {:+f}%, CLOSE: {:+f}%, HIGH: {:+f}%, LOW: {:+f}%, VOL: {}, TRADES: {}' \
-            .format(d.time.strftime('%Y-%m-%d %H:%M'), \
-            d.open, d.close, d.high, d.low, d.vol, d.trades))
+    max_[0] = max(max_[0], frac_change)
+    max_[1] = max(max_[1], frac_high)
+    max_[2] = max(max_[2], frac_low)
+    min_[0] = min(min_[0], frac_change)
+    min_[1] = min(min_[1], frac_high)
+    min_[2] = min(min_[2], frac_low)
 
-    diff_min.open = min(diff_min.open, d.open)
-    diff_min.close = min(diff_min.close, d.close)
-    diff_min.high = min(diff_min.high, d.high)
-    diff_min.low = min(diff_min.low, d.low)
-    diff_min.vol = min(diff_min.vol, d.vol)
-    diff_min.trades = min(diff_min.trades, d.trades)
+    # print("data: franc_change: {}, frac_high: {}, frac_low: {}" \
+    #         .format(frac_change, frac_high, frac_low))
+    data.append([ frac_change, frac_high, frac_low ])
 
-    diff_max.open = max(diff_max.open, d.open)
-    diff_max.close = max(diff_max.close, d.close)
-    diff_max.high = max(diff_max.high, d.high)
-    diff_max.low = max(diff_max.low, d.low)
-    diff_max.vol = max(diff_max.vol, d.vol)
-    diff_max.trades = max(diff_max.trades, d.trades)
+model = hmm.GMMHMM(n_components = 4, covariance_type='full', \
+                   n_iter = 100, n_mix = 5, algorithm="map")
+model.fit(data[:3000], [3000])
 
-print('OPEN:   MIN: {:+f}%, MAX: {:+f}%'.format(diff_min.open, diff_max.open))
-print('CLOSE:  MIN: {:+f}%, MAX: {:+f}%'.format(diff_min.close, diff_max.close))
-print('HIGH:   MIN: {:+f}%, MAX: {:+f}%'.format(diff_min.high, diff_max.high))
-print('LOW:    MIN: {:+f}%, MAX: {:+f}%'.format(diff_min.low, diff_max.low))
-print('VOL:    MIN: {:+f}, MAX: {:+f}'.format(diff_min.vol, diff_max.vol))
-print('TRADES: MIN: {:+f}, MAX: {:+f}'.format(diff_min.trades, diff_max.trades))
+print(model.monitor_)
+print(model.monitor_.converged)
+print(model.score(data[:3000], [3000]))
+print(model.monitor_)
+print(model.monitor_.converged)
 
-percentiles=[]
-ncentiles = 10
+print("=== inferred hmm params:")
+print(" states: {}".format(model.n_components))
+print(" gaussian mix components: {}".format(model.n_mix))
+print(" data dimentions: {}".format(model.n_features))
 
-for i in range(0, ncentiles):
-    percentiles.append(0)
+print("=== per-state weights of mix components:")
+print(model.weights_)
+print("=== per-state/mix means of gaussian components:")
+print(model.means_)
+print("=== per-state/mix covariance of gaussian components:")
+print(model.covars_)
 
-for d in data:
-    r = diff_max.open - diff_min.open
-    percentile = int((d.open - diff_min.open) * 100 / r) // (100 // ncentiles)
-    percentile = min(percentile, ncentiles - 1)
-    percentiles[percentile] += 1
+#exit(0)
 
-for i in range(0, ncentiles):
-    r = ((diff_max.open - diff_min.open) / (100 // ncentiles))
-    lo = diff_min.open + i * r
-    hi = diff_min.open + (i + 1) * r
-    prob = percentiles[i] / len(data)
-    print('percentile {}: {} values, prob = {} (range: {} -> {})'.format(i, percentiles[i], prob * 100, lo, hi))
+# possible values intervals that we try to test the
+# model with to predict the future values
+step_change = (max_[0] - min_[0]) / 10
+step_high = (max_[1] - min_[1]) / 10
+step_low = (max_[2] - min_[2]) / 10
+futures = []
+for i in range(0, 10):
+    change = min_[0] + i * step_change
+    for j in range(0, 10):
+        high = min_[1] + j * step_high
+        for k in range(0, 10):
+            low = min_[2] + k * step_low
+            futures.append([ change, high, low ])
 
+# test data: for every 10 days window sequence of data
+# try to predict the 11th day value by computing the max
+# log-likelihood of the 11-day sequence for any possible
+# 11th value from futures
+# don't use training data:
+test_data = data[3000:]
+for i in range(0, 100):
+    # 10 = days of the data window
+    data_seq = test_data[i:i+10]
 
+    max_ll = 0
+    best_guess = []
+    for f in futures:
+        seq = data_seq + [f]
+        ll = model.score(seq, [len(seq)])
+        #print("test with {}: {}".format(f, ll))
+        if ll > max_ll:
+            max_ll = ll
+            best_guess = f
+
+    # compare with actual value
+    obs = test_data[i + 10]
+    print("guess: {}, actual: {}, ll={}".format(best_guess, obs, max_ll))
